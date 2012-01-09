@@ -4,7 +4,6 @@
 
 #define NGX_HMUX_DEFAULT_PORT       6802
 #define NGX_HMUX_CHANNEL_LEN        3
-#define NGX_HTTP_CHUNK_END          "0" CRLF CRLF
 
 #define NGX_HMUX_STRING_LEN(a)      (3 + (a))
 #define NGX_HMUX_WRITE_CMD(p, cmd, len)                           \
@@ -89,15 +88,12 @@ typedef struct {
 } ngx_http_hmux_loc_conf_t;
 
 typedef struct {
-  ngx_http_status_t               status;
   ngx_str_t                       key;
   ngx_str_t                       value;
 
   ngx_uint_t                      body_chunk_size;
 
   unsigned                        key_done:1;
-
-  unsigned                        recv_body_done:1;
 
   ngx_uint_t                      cmd_state;
   ngx_uint_t                      cmd_len;
@@ -545,6 +541,18 @@ static ngx_int_t ngx_http_hmux_create_request(ngx_http_request_t *r) {
 }
 
 static ngx_int_t ngx_http_hmux_reinit_request(ngx_http_request_t *r) {
+  ngx_http_hmux_ctx_t     *ctx;
+
+  ctx = ngx_http_get_module_ctx(r, ngx_http_hmux_module);
+
+  if (ctx == NULL) {
+    return NGX_OK;
+  }
+
+  ctx->key_done = 0;
+  ctx->cmd_state = 0;
+  ctx->body_chunk_size = 0;
+
   return NGX_OK;
 }
 
@@ -679,6 +687,10 @@ static ngx_int_t ngx_http_hmux_process_header(ngx_http_request_t *r) {
   for ( ;; ){
     rc = ngx_http_hmux_process_cmd(r, ctx, &r->upstream->buffer, 1);
 
+    if (rc == NGX_AGAIN){
+      return NGX_AGAIN;
+    }
+
     if (rc == NGX_OK){
       switch (ctx->cmd){
         case HMUX_STATUS:
@@ -740,7 +752,8 @@ static ngx_int_t ngx_http_hmux_process_header(ngx_http_request_t *r) {
           ngx_cpystrn(h->value.data, ctx->value.data,
               h->value.len + 1);
 
-          h->hash = ngx_hash_strlow(h->lowcase_key, ctx->key.data, ctx->key.len);
+          h->hash = ngx_hash_strlow(h->lowcase_key, ctx->key.data,
+              ctx->key.len);
 
           hh = ngx_hash_find(&umcf->headers_in_hash, h->hash,
               h->lowcase_key, h->key.len);
@@ -773,9 +786,9 @@ static ngx_int_t ngx_http_hmux_process_header(ngx_http_request_t *r) {
       continue;
     }
 
-    if (rc == NGX_AGAIN){
-      return NGX_AGAIN;
-    }
+
+    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+        "upstream sent invalid header");
 
     return NGX_HTTP_UPSTREAM_INVALID_HEADER;
   }
@@ -784,11 +797,15 @@ static ngx_int_t ngx_http_hmux_process_header(ngx_http_request_t *r) {
 static ngx_int_t ngx_http_hmux_input_filter_init(void *data) {
   ngx_http_request_t    *r = data;
   ngx_http_upstream_t   *u;
+  ngx_http_hmux_ctx_t   *ctx;
 
   u = r->upstream;
 
+  ctx = ngx_http_get_module_ctx(r, ngx_http_hmux_module);
+
+  u->pipe->length = ctx->body_chunk_size + 1;
+
   u->length = -1;
-  u->pipe->length = -1;
 
   return NGX_OK;
 }
