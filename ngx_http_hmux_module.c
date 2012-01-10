@@ -666,6 +666,7 @@ static ngx_int_t ngx_http_hmux_process_cmd(ngx_http_request_t *r,
 
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                 "http hmux new data chunk: %i", ctx->body_chunk_size);
+
             goto done;
 
           default:
@@ -778,10 +779,6 @@ static ngx_int_t ngx_http_hmux_process_header(ngx_http_request_t *r) {
 
           break;
 
-        case HMUX_DATA:
-          ngx_str_set(&ctx->key, "Transfer-Encoding");
-          ngx_str_set(&ctx->value, "chunked");
-          
         case HMUX_HEADER:
           h = ngx_list_push(&u->headers_in.headers);
           if (h == NULL) {
@@ -822,20 +819,18 @@ static ngx_int_t ngx_http_hmux_process_header(ngx_http_request_t *r) {
               &h->key, &h->value);
           break;
 
+        case CSE_SEND_HEADER:
+          return NGX_OK;
+
         case HMUX_META_HEADER: //IGNORE
         case HMUX_CHANNEL:
         case HMUX_FLUSH:
-        case CSE_SEND_HEADER:
         case HMUX_ACK:
         default:
           ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
               "http hmux ignore cmd: '%c' %02d %i",
               ctx->cmd, ctx->cmd, ctx->cmd_len);
           break;
-      }
-
-      if (ctx->cmd == HMUX_DATA) {
-        return NGX_OK;
       }
 
       continue;
