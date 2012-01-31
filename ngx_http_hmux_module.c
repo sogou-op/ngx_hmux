@@ -87,7 +87,7 @@ typedef struct {
 
   ngx_http_complex_value_t        *complex_upstream;
 
-  size_t                          send_buffer_size;
+  size_t                          ack_size;
 } ngx_http_hmux_loc_conf_t;
 
 typedef struct {
@@ -238,6 +238,13 @@ static ngx_command_t ngx_http_hmux_commands[] = {
     ngx_conf_set_str_array_slot,
     NGX_HTTP_LOC_CONF_OFFSET,
     offsetof(ngx_http_hmux_loc_conf_t, upstream.hide_headers),
+    NULL },
+
+  { ngx_string("hmux_ack_size"),
+    NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+    ngx_conf_set_size_slot,
+    NGX_HTTP_LOC_CONF_OFFSET,
+    offsetof(ngx_http_hmux_loc_conf_t, ack_size),
     NULL },
 
   ngx_null_command
@@ -417,11 +424,15 @@ ngx_http_hmux_get_data_chain(ngx_http_request_t *r, ngx_chain_t *in,
   ngx_buf_t                     *b;
   ngx_chain_t                   *body, *cl, *top, *next, *last, **ll;
   ngx_http_hmux_ctx_t           *ctx;
-
-  ngx_uint_t                    ack_size = 64 * 2 * 1024;
+  ngx_http_hmux_loc_conf_t      *hlcf;
 
   ctx = ngx_http_get_module_ctx(r, ngx_http_hmux_module);
   if (ctx == NULL) {
+    return NGX_ERROR;
+  }
+
+  hlcf = ngx_http_get_module_loc_conf(r, ngx_http_hmux_module);
+  if (hlcf == NULL) {
     return NGX_ERROR;
   }
 
@@ -546,7 +557,7 @@ ngx_http_hmux_get_data_chain(ngx_http_request_t *r, ngx_chain_t *in,
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
         "http hmux add trunk: t:%uz c:%uz", chunk_size, chain_size);
 
-    if (chain_size >= ack_size) {
+    if (chain_size >= hlcf->ack_size) {
       b = ngx_create_temp_buf(r->pool, 1);
       if (b == NULL) {
         return NGX_ERROR;
@@ -572,7 +583,7 @@ ngx_http_hmux_get_data_chain(ngx_http_request_t *r, ngx_chain_t *in,
       "http hmux data chain: c:%uz", chain_size);
 
   if (ctx->segments == NULL) {
-    if (in == NULL || (body == NULL && chain_size >= ack_size)) {
+    if (in == NULL || (body == NULL && chain_size >= hlcf->ack_size)) {
       ctx->segments = ngx_array_create(r->pool, 4, sizeof(ngx_chain_t *));
       if (ctx->segments == NULL) {
         return NGX_ERROR;
@@ -603,7 +614,7 @@ ngx_http_hmux_get_data_chain(ngx_http_request_t *r, ngx_chain_t *in,
 
     b->flush = 1;
 
-    if (chain_size >= ack_size) {
+    if (chain_size >= hlcf->ack_size) {
       last = ngx_alloc_chain_link(r->pool);
       if (last == NULL) {
         return NGX_ERROR;
@@ -1306,8 +1317,8 @@ ngx_http_hmux_chunked_filter(ngx_event_pipe_t *p, ngx_buf_t *buf){
   do {
     if (ctx->body_chunk_size) {
       ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-          "http hmux fill data chunk: %i, bytes: %i",
-          ctx->body_chunk_size, buf->last - buf->pos);
+          "http hmux fill data chunk: %ui @%ui",
+          buf->last - buf->pos, ctx->body_chunk_size);
 
       if (p->free) {
         cl = p->free;
@@ -1352,7 +1363,7 @@ ngx_http_hmux_chunked_filter(ngx_event_pipe_t *p, ngx_buf_t *buf){
       b->num = buf->num;
 
       ngx_log_debug2(NGX_LOG_DEBUG_EVENT, p->log, 0,
-          "input buf #%d %p", b->num, b->pos);
+          "http hmux input buf #%d %p", b->num, b->pos);
 
       if (buf->last - buf->pos >= ctx->body_chunk_size) {
         buf->pos += ctx->body_chunk_size;
@@ -1374,6 +1385,7 @@ ngx_http_hmux_chunked_filter(ngx_event_pipe_t *p, ngx_buf_t *buf){
     if (rc == NGX_OK){
       switch (ctx->cmd) {
         case HMUX_QUIT:
+        case HMUX_EXIT:
           ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
               "http hmux send quit");
 
@@ -1423,7 +1435,7 @@ ngx_http_hmux_chunked_filter(ngx_event_pipe_t *p, ngx_buf_t *buf){
     b->last_shadow = 1;
 
     ngx_log_debug2(NGX_LOG_DEBUG_EVENT, p->log, 0,
-        "input buf %p %z", b->pos, b->last - b->pos);
+        "http hmux input buf %p %z", b->pos, b->last - b->pos);
 
     return NGX_OK;
   }
@@ -1492,7 +1504,7 @@ static ngx_int_t ngx_http_hmux_non_buffered_chunked_filter(void *data,
   for ( ;; ){
     if (ctx->body_chunk_size) {
       ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-          "http hmux fill data chunk: %i, bytes: %i", ctx->body_chunk_size, bytes);
+          "http hmux fill data chunk: %ui @%ui", bytes, ctx->body_chunk_size);
 
       len = ngx_min(bytes, ctx->body_chunk_size);
 
@@ -1602,7 +1614,7 @@ static void *ngx_http_hmux_create_loc_conf(ngx_conf_t *cf){
   conf->upstream.max_temp_file_size_conf = NGX_CONF_UNSET_SIZE;
   conf->upstream.temp_file_write_size_conf = NGX_CONF_UNSET_SIZE;
 
-  conf->send_buffer_size = NGX_CONF_UNSET_SIZE;
+  conf->ack_size = NGX_CONF_UNSET_SIZE;
 
   conf->upstream.hide_headers = NGX_CONF_UNSET_PTR;
   conf->upstream.pass_headers = NGX_CONF_UNSET_PTR;
@@ -1738,8 +1750,8 @@ static char *ngx_http_hmux_merge_loc_conf(ngx_conf_t *cf,
     return NGX_CONF_ERROR;
   }
 
-  ngx_conf_merge_size_value(conf->send_buffer_size,
-      prev->send_buffer_size,
+  ngx_conf_merge_size_value(conf->ack_size,
+      prev->ack_size,
       16 * 1024);
 
   ngx_conf_merge_bitmask_value(conf->upstream.next_upstream,
