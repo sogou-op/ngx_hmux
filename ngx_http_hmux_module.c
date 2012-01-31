@@ -4,6 +4,9 @@
 
 #define NGX_HMUX_DEFAULT_PORT       6802
 #define NGX_HMUX_CHANNEL_LEN        3
+#define NGX_HMUX_ACK_CMD_LEN        3
+#define NGX_HMUX_DATA_MAX_SIZE      ((1 << 16) - 1)
+#define NGX_BUF_FLEN_FIELD          end
 
 #define NGX_HMUX_STRING_LEN(a)      (3 + (a))
 #define NGX_HMUX_WRITE_CMD(p, cmd, len)                           \
@@ -93,12 +96,22 @@ typedef struct {
 
   ngx_uint_t                      body_chunk_size;
 
+  off_t                           rest;
+  ngx_chain_t                     *in;
+  ngx_array_t                     *segments;
+  ngx_int_t                       segment_idx;
+
   unsigned                        key_done:1;
 
   ngx_uint_t                      cmd_state;
   ngx_uint_t                      cmd_len;
   u_char                          cmd;
 } ngx_http_hmux_ctx_t;
+
+void ngx_http_upstream_next(ngx_http_request_t *r, ngx_http_upstream_t *u,
+    ngx_uint_t ft_type);
+void ngx_http_upstream_finalize_request(ngx_http_request_t *r,
+    ngx_http_upstream_t *u, ngx_int_t rc);
 
 static void *ngx_http_hmux_create_loc_conf(ngx_conf_t *cf);
 static char *ngx_http_hmux_merge_loc_conf(ngx_conf_t *cf,
@@ -122,7 +135,10 @@ static ngx_int_t ngx_http_hmux_chunked_filter(ngx_event_pipe_t *p,
     ngx_buf_t *buf);
 static ngx_int_t ngx_http_hmux_input_filter_init(void *data);
 static ngx_int_t ngx_http_hmux_non_buffered_chunked_filter(void *data,
-        ssize_t bytes);
+    ssize_t bytes);
+
+static void ngx_http_hmux_upstream_send_body_handler(ngx_http_request_t *r,
+    ngx_http_upstream_t *u);
 
 static ngx_conf_bitmask_t  ngx_http_hmux_next_upstream_masks[] = {
   { ngx_string("error"), NGX_HTTP_UPSTREAM_FT_ERROR },
@@ -392,6 +408,275 @@ ngx_http_hmux_eval(ngx_http_request_t *r, ngx_http_hmux_loc_conf_t *hlcf)
   return NGX_OK;
 }
 
+static ngx_int_t
+ngx_http_hmux_get_data_chain(ngx_http_request_t *r, ngx_chain_t *in,
+    ngx_chain_t **out)
+{
+  u_char                        *p;
+  size_t                        chunk_size, chain_size, buf_size, offset, eat;
+  ngx_buf_t                     *b;
+  ngx_chain_t                   *body, *cl, *top, *next, *last, **ll;
+  ngx_http_hmux_ctx_t           *ctx;
+
+  ngx_uint_t                    ack_size = 64 * 2 * 1024;
+
+  ctx = ngx_http_get_module_ctx(r, ngx_http_hmux_module);
+  if (ctx == NULL) {
+    return NGX_ERROR;
+  }
+
+  if (in != NULL) {
+
+    ctx->rest = r->headers_in.content_length_n;
+
+  } else if (ctx->segments && ctx->segment_idx < ctx->segments->nelts) {
+    ll = ctx->segments->elts;
+
+    *out = ll[ctx->segment_idx ++];
+
+    return NGX_OK;
+  } else if (ctx->in == NULL && ctx->segment_idx >= ctx->segments->nelts) {
+    return NGX_DONE;
+  }
+
+  body = in ? in : ctx->in;
+
+  top = ngx_alloc_chain_link(r->pool);
+  if (top == NULL) {
+    return NGX_ERROR;
+  }
+
+  cl = top;
+
+  offset = 0;
+
+  chain_size = 0;
+
+  while (body) {
+    b = ngx_create_temp_buf(r->pool, 3);
+    if (b == NULL) {
+      return NGX_ERROR;
+    }
+
+    p = b->pos;
+
+    b->last += 3;
+
+    cl->buf = b;
+
+    cl->next = ngx_alloc_chain_link(r->pool);
+    if (cl->next == NULL) {
+      return NGX_ERROR;
+    }
+
+    cl = cl->next;
+
+    chunk_size = 0;
+
+    while (body) {
+      b = ngx_alloc_buf(r->pool);
+      if (b == NULL) {
+        return NGX_ERROR;
+      }
+
+      ngx_memcpy(b, body->buf, sizeof(ngx_buf_t));
+
+      cl->buf = b;
+
+      cl->next = ngx_alloc_chain_link(r->pool);
+      if (cl->next == NULL) {
+        return NGX_ERROR;
+      }
+
+      cl = cl->next;
+
+      if (offset) {
+        if (ngx_buf_in_memory(b)) {
+          b->start += offset;
+          b->pos = b->start;
+        } else {
+          b->file_pos += offset;
+        }
+      }
+
+      buf_size = ngx_buf_size(b);
+
+      if (chunk_size + buf_size > NGX_HMUX_DATA_MAX_SIZE) {
+        eat = NGX_HMUX_DATA_MAX_SIZE - chunk_size;
+
+        ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+            "http hmux split buf: o:%O s:%uz b:%uz", offset, eat, buf_size);
+
+        offset += eat;
+
+        if (ngx_buf_in_memory(b)) {
+          b->last = b->pos + eat;
+        } else {
+          b->file_last = b->file_pos + eat;
+          b->NGX_BUF_FLEN_FIELD = (u_char *)eat;
+        }
+
+        chunk_size = NGX_HMUX_DATA_MAX_SIZE;
+
+        break;
+      }
+
+      offset = 0;
+
+      chunk_size += buf_size;
+
+      if (in == NULL) {
+        next = body->next;
+
+        ngx_free_chain(r->pool, body);
+
+        body = next;
+      } else {
+        body = body->next;
+      }
+
+      if (chunk_size == NGX_HMUX_DATA_MAX_SIZE)
+        break;
+    }
+
+    NGX_HMUX_WRITE_CMD(p, HMUX_DATA, chunk_size);
+
+    chain_size += chunk_size;
+
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+        "http hmux add trunk: t:%uz c:%uz", chunk_size, chain_size);
+
+    if (chain_size >= ack_size) {
+      b = ngx_create_temp_buf(r->pool, 1);
+      if (b == NULL) {
+        return NGX_ERROR;
+      }
+
+      *b->last ++ = HMUX_YIELD;
+
+      b->flush = 1;
+
+      cl->buf = b;
+
+      break;
+    }
+
+    if (body == NULL) {
+      break;
+    }
+  }
+
+  cl->next = NULL;
+
+  ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+      "http hmux data chain: c:%uz", chain_size);
+
+  if (ctx->segments == NULL) {
+    if (in == NULL || (body == NULL && chain_size >= ack_size)) {
+      ctx->segments = ngx_array_create(r->pool, 4, sizeof(ngx_chain_t *));
+      if (ctx->segments == NULL) {
+        return NGX_ERROR;
+      }
+    }
+  }
+
+  if (in == NULL) {
+    ll = ngx_array_push(ctx->segments);
+    if (ll == NULL) {
+      return NGX_ERROR;
+    }
+
+    *ll = top;
+
+    ctx->segment_idx = ctx->segments->nelts;
+  }
+
+  last = NULL;
+
+  if (body == NULL) {
+    b = ngx_create_temp_buf(r->pool, 1);
+    if (b == NULL) {
+      return NGX_ERROR;
+    }
+
+    *b->last ++ = HMUX_QUIT;
+
+    b->flush = 1;
+
+    if (chain_size >= ack_size) {
+      last = ngx_alloc_chain_link(r->pool);
+      if (last == NULL) {
+        return NGX_ERROR;
+      }
+
+      last->buf = b;
+      last->next = NULL;
+
+      ll = ngx_array_push(ctx->segments);
+      if (ll == NULL) {
+        return NGX_ERROR;
+      }
+
+      *ll = last;
+    } else {
+      cl->buf = b;
+    }
+
+    ctx->in = NULL;
+  } else {
+    // save chains left
+    if (in == NULL) {
+      ctx->in = body;
+    } else {
+      ll = &ctx->in;
+
+      while (body) {
+        b = ngx_alloc_buf(r->pool);
+        if (b == NULL) {
+          return NGX_ERROR;
+        }
+
+        ngx_memcpy(b, body->buf, sizeof(ngx_buf_t));
+
+        cl = ngx_alloc_chain_link(r->pool);
+        if (cl == NULL) {
+          return NGX_ERROR;
+        }
+
+        cl->buf = b;
+
+        *ll = cl;
+
+        ll = &cl->next;
+
+        body = body->next;
+      }
+
+      *ll = NULL;
+    }
+
+    if (offset) {
+      b = ctx->in->buf;
+
+      if (ngx_buf_in_memory(b)) {
+        b->start += offset;
+        b->pos = b->start;
+      } else {
+        b->file_pos += offset;
+      }
+    }
+  }
+
+  *out = top;
+
+  ctx->rest -= chain_size;
+
+  ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+      "http hmux send body %O, rest %O", chain_size, ctx->rest);
+
+  return NGX_OK;
+}
+
 static ngx_int_t ngx_http_hmux_create_request(ngx_http_request_t *r) {
   size_t                        len, uri_len;
   uintptr_t                     escape;
@@ -401,12 +686,12 @@ static ngx_int_t ngx_http_hmux_create_request(ngx_http_request_t *r) {
   ngx_table_elt_t               *header;
 
   ngx_buf_t                     *b;
-  ngx_chain_t                   *cl, *body;
+  ngx_chain_t                   *cl, *body, *chunks;
   ngx_http_upstream_t           *u;
 
   u = r->upstream;
 
-  len = NGX_HMUX_CHANNEL_LEN + 1;
+  len = NGX_HMUX_CHANNEL_LEN + 1; // 1 for HMUX_QUIT
 
   // env
   escape = 0;
@@ -564,39 +849,26 @@ static ngx_int_t ngx_http_hmux_create_request(ngx_http_request_t *r) {
   body = u->request_bufs;
   u->request_bufs = cl;
 
-#if 0
-  send_body_size = 0;
+  if (r->headers_in.content_length_n <= 0) {
+    *b->last ++ = HMUX_QUIT;
 
-  while (body) {
-    b = ngx_alloc_buf(r->pool);
-    if (b == NULL) {
-      return NGX_ERROR;
+    b->flush = 1;
+    cl->next = NULL;
+  } else {
+    if (ngx_http_hmux_get_data_chain(r, body, &chunks) != NGX_OK){
+      return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    ngx_memcpy(b, body->buf, sizeof(ngx_buf_t));
-
-    cl->next = ngx_alloc_chain_link(r->pool);
-    if (cl->next == NULL) {
-      return NGX_ERROR;
-    }
-
-    cl = cl->next;
-    cl->buf = b;
-
-    body = body->next;
+    cl->next = chunks;
   }
-#endif
-
-  *b->last ++ = HMUX_QUIT;
-
-  b->flush = 1;
-  cl->next = NULL;
 
   return NGX_OK;
 }
 
 static ngx_int_t ngx_http_hmux_reinit_request(ngx_http_request_t *r) {
   ngx_http_hmux_ctx_t     *ctx;
+  ngx_chain_t             *cl, **ll;
+  ngx_int_t               i;
 
   ctx = ngx_http_get_module_ctx(r, ngx_http_hmux_module);
 
@@ -607,6 +879,22 @@ static ngx_int_t ngx_http_hmux_reinit_request(ngx_http_request_t *r) {
   ctx->key_done = 0;
   ctx->cmd_state = 0;
   ctx->body_chunk_size = 0;
+
+  if (ctx->segments) {
+    ctx->segment_idx = 0;
+
+    ll = ctx->segments->elts;
+
+    for (i = 0; i < ctx->segments->nelts; i ++) {
+      for (cl = ll[i]; cl; cl = cl->next) {
+        cl->buf->pos = cl->buf->start;
+        if (cl->buf->file_last) {
+          cl->buf->file_pos = cl->buf->file_last -
+            (off_t) cl->buf->NGX_BUF_FLEN_FIELD;
+        }
+      }
+    }
+  }
 
   return NGX_OK;
 }
@@ -723,8 +1011,104 @@ done:
   return NGX_OK;
 }
 
+static void
+ngx_http_hmux_upstream_dummy_handler(ngx_http_request_t *r, ngx_http_upstream_t *u)
+{
+  ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+      "http hmux upstream dummy handler");
+}
+
+static ngx_int_t ngx_http_hmux_send_body_chunk(ngx_http_upstream_t *u,
+    ngx_chain_t *in)
+{
+  ngx_int_t             rc;
+  ngx_connection_t      *c;
+
+  c = u->peer.connection;
+
+  ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0,
+      "http hmux upstream send body");
+
+  rc = ngx_output_chain(&u->output, in);
+
+  if (rc == NGX_ERROR) {
+    return NGX_ERROR;
+  }
+
+  if (c->write->timer_set) {
+    ngx_del_timer(c->write);
+  }
+
+  if (rc == NGX_AGAIN) {
+    ngx_add_timer(c->write, u->conf->send_timeout);
+
+    u->write_event_handler = ngx_http_hmux_upstream_send_body_handler;
+
+    if (ngx_handle_write_event(c->write, u->conf->send_lowat) != NGX_OK) {
+      return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    return NGX_AGAIN;
+  }
+
+  /* rc == NGX_OK */
+
+  if (c->tcp_nopush == NGX_TCP_NOPUSH_SET) {
+    if (ngx_tcp_push(c->fd) == NGX_ERROR) {
+      ngx_log_error(NGX_LOG_CRIT, c->log, ngx_socket_errno,
+          ngx_tcp_push_n " failed");
+      return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    c->tcp_nopush = NGX_TCP_NOPUSH_UNSET;
+  }
+
+  ngx_add_timer(c->read, u->conf->read_timeout);
+
+  u->write_event_handler = ngx_http_hmux_upstream_dummy_handler;
+
+  if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
+    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+  }
+
+  return NGX_OK;
+}
+
+static void
+ngx_http_hmux_upstream_send_body_handler(ngx_http_request_t *r,
+    ngx_http_upstream_t *u)
+{
+  ngx_int_t                   rc;
+  ngx_connection_t            *c;
+
+  c = u->peer.connection;
+
+  ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+     "http hmux upstream send body handler");
+
+  if (c->write->timedout) {
+    ngx_http_upstream_next(r, u, NGX_HTTP_UPSTREAM_FT_TIMEOUT);
+    return;
+  }
+
+  rc = ngx_http_hmux_send_body_chunk(u, NULL);
+
+  if (rc == NGX_ERROR) {
+    ngx_http_upstream_next(r, u, NGX_HTTP_UPSTREAM_FT_ERROR);
+    return;
+  }
+
+  if (rc == NGX_HTTP_INTERNAL_SERVER_ERROR) {
+    ngx_http_upstream_finalize_request(r, u,
+        NGX_HTTP_INTERNAL_SERVER_ERROR);
+    return;
+  }
+}
+
 static ngx_int_t ngx_http_hmux_process_header(ngx_http_request_t *r) {
   ngx_int_t                       rc, code;
+  ngx_buf_t                       *b;
+  ngx_chain_t                     *cl;
   ngx_table_elt_t                 *h;
   ngx_http_upstream_t             *u;
   ngx_http_hmux_ctx_t             *ctx;
@@ -740,8 +1124,10 @@ static ngx_int_t ngx_http_hmux_process_header(ngx_http_request_t *r) {
 
   u = r->upstream;
 
+  b = &u->buffer;
+
   for ( ;; ){
-    rc = ngx_http_hmux_process_cmd(r, ctx, &r->upstream->buffer, 1);
+    rc = ngx_http_hmux_process_cmd(r, ctx, b, 1);
 
     if (rc == NGX_AGAIN){
       return NGX_AGAIN;
@@ -822,10 +1208,48 @@ static ngx_int_t ngx_http_hmux_process_header(ngx_http_request_t *r) {
         case CSE_SEND_HEADER:
           return NGX_OK;
 
+        case HMUX_ACK:
+          ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+              "http hmux ack received");
+
+          /* for large post body, there will be too many acks */
+
+          if (b->pos == b->last) {
+            b->last -= NGX_HMUX_ACK_CMD_LEN;
+            b->pos = b->last;
+          }
+
+          rc = ngx_http_hmux_get_data_chain(r, NULL, &cl);
+
+          if (rc == NGX_OK) {
+            rc = ngx_http_hmux_send_body_chunk(u, cl);
+
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                "http hmux send next chain return %i", rc);
+
+            if (rc == NGX_HTTP_INTERNAL_SERVER_ERROR) {
+              return NGX_ERROR;
+            }
+
+            if (rc == NGX_ERROR) {
+              return NGX_HTTP_UPSTREAM_INVALID_HEADER;
+            }
+
+          } else if (rc == NGX_DONE) {
+            ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                "http hmux body sent done");
+          } else {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                "http hmux body get data error");
+
+            return NGX_ERROR;
+          }
+
+          break;
+
         case HMUX_META_HEADER: //IGNORE
         case HMUX_CHANNEL:
         case HMUX_FLUSH:
-        case HMUX_ACK:
         default:
           ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
               "http hmux ignore cmd: '%c' %02d %i",
