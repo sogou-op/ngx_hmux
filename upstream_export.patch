@@ -1,0 +1,47 @@
+diff -rpuN nginx-1.1.13/src/http/ngx_http_upstream.c nginx-1.1.13_zls/src/http/ngx_http_upstream.c
+--- nginx-1.1.13/src/http/ngx_http_upstream.c	2011-12-26 19:15:23.000000000 +0800
++++ nginx-1.1.13_zls/src/http/ngx_http_upstream.c	2012-01-31 14:23:22.099999983 +0800
+@@ -64,11 +64,7 @@ static void ngx_http_upstream_store(ngx_
+     ngx_http_upstream_t *u);
+ static void ngx_http_upstream_dummy_handler(ngx_http_request_t *r,
+     ngx_http_upstream_t *u);
+-static void ngx_http_upstream_next(ngx_http_request_t *r,
+-    ngx_http_upstream_t *u, ngx_uint_t ft_type);
+ static void ngx_http_upstream_cleanup(void *data);
+-static void ngx_http_upstream_finalize_request(ngx_http_request_t *r,
+-    ngx_http_upstream_t *u, ngx_int_t rc);
+ 
+ static ngx_int_t ngx_http_upstream_process_header_line(ngx_http_request_t *r,
+     ngx_table_elt_t *h, ngx_uint_t offset);
+@@ -2823,7 +2819,7 @@ ngx_http_upstream_dummy_handler(ngx_http
+ }
+ 
+ 
+-static void
++void
+ ngx_http_upstream_next(ngx_http_request_t *r, ngx_http_upstream_t *u,
+     ngx_uint_t ft_type)
+ {
+@@ -2972,7 +2968,7 @@ ngx_http_upstream_cleanup(void *data)
+ }
+ 
+ 
+-static void
++void
+ ngx_http_upstream_finalize_request(ngx_http_request_t *r,
+     ngx_http_upstream_t *u, ngx_int_t rc)
+ {
+diff -rpuN nginx-1.1.13/src/http/ngx_http_upstream.h nginx-1.1.13_zls/src/http/ngx_http_upstream.h
+--- nginx-1.1.13/src/http/ngx_http_upstream.h	2011-12-26 19:15:23.000000000 +0800
++++ nginx-1.1.13_zls/src/http/ngx_http_upstream.h	2012-01-31 14:20:13.972242733 +0800
+@@ -353,6 +353,10 @@ ngx_int_t ngx_http_upstream_hide_headers
+     ngx_http_upstream_conf_t *conf, ngx_http_upstream_conf_t *prev,
+     ngx_str_t *default_hide_headers, ngx_hash_init_t *hash);
+ 
++void ngx_http_upstream_next(ngx_http_request_t *r, ngx_http_upstream_t *u,
++    ngx_uint_t ft_type);
++void ngx_http_upstream_finalize_request(ngx_http_request_t *r,
++    ngx_http_upstream_t *u, ngx_int_t rc);
+ 
+ #define ngx_http_conf_upstream_srv_conf(uscf, module)                         \
+     uscf->srv_conf[module.ctx_index]
