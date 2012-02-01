@@ -1396,6 +1396,9 @@ ngx_http_hmux_chunked_filter(ngx_event_pipe_t *p, ngx_buf_t *buf){
           break;
 
         case HMUX_FLUSH:
+          ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+              "http hmux flush received");
+
           break;
 
         case HMUX_DATA:
@@ -1424,11 +1427,11 @@ ngx_http_hmux_chunked_filter(ngx_event_pipe_t *p, ngx_buf_t *buf){
   if (ctx->body_chunk_size) {
     p->length = ctx->body_chunk_size + 1; /* + HMUX_QUIT */
   } else if (!p->upstream_done) {
-    p->length = -1;
+    p->length = 1;
   }
 
   ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-      "http hmux chunked, length %d", p->length);
+      "http hmux pipe set next expect length %d", p->length);
 
   if (b) {
     b->shadow = buf;
@@ -1537,6 +1540,7 @@ static ngx_int_t ngx_http_hmux_non_buffered_chunked_filter(void *data,
     if (rc == NGX_OK){
       switch (ctx->cmd){
         case HMUX_QUIT:
+        case HMUX_EXIT:
           ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
               "http hmux get hmux quit");
 
