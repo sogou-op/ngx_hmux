@@ -1391,7 +1391,7 @@ ngx_http_hmux_chunked_filter(ngx_event_pipe_t *p, ngx_buf_t *buf){
 
           p->length = 0;
           p->upstream_done = 1;
-          r->upstream->keepalive = 1;
+          r->upstream->keepalive = ctx->cmd == HMUX_QUIT;
 
           break;
 
@@ -1545,7 +1545,7 @@ static ngx_int_t ngx_http_hmux_non_buffered_chunked_filter(void *data,
               "http hmux get hmux quit");
 
           u->length = 0;
-          u->keepalive = 1;
+          u->keepalive = ctx->cmd == HMUX_QUIT;
 
           return NGX_OK;
 
