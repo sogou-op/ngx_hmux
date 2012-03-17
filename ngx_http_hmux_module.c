@@ -555,7 +555,7 @@ ngx_http_hmux_get_data_chain(ngx_http_request_t *r, ngx_chain_t *in,
     chain_size += chunk_size;
 
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-        "http hmux add trunk: t:%uz c:%uz", chunk_size, chain_size);
+        "http hmux add chunk: t:%uz c:%uz", chunk_size, chain_size);
 
     if (chain_size >= hlcf->ack_size) {
       b = ngx_create_temp_buf(r->pool, 1);
@@ -689,9 +689,14 @@ ngx_http_hmux_get_data_chain(ngx_http_request_t *r, ngx_chain_t *in,
 }
 
 static ngx_int_t ngx_http_hmux_create_request(ngx_http_request_t *r) {
-  size_t                        len, uri_len;
+  size_t                        len, uri_len, port_len;
   uintptr_t                     escape;
-  ngx_uint_t                    i, unparsed_uri;
+  ngx_uint_t                    i, unparsed_uri, port;
+
+  struct sockaddr_in            *sin;
+#if (NGX_HAVE_INET6)
+  struct sockaddr_in6           *sin6;
+#endif
 
   ngx_list_part_t               *part;
   ngx_table_elt_t               *header;
@@ -699,6 +704,8 @@ static ngx_int_t ngx_http_hmux_create_request(ngx_http_request_t *r) {
   ngx_buf_t                     *b;
   ngx_chain_t                   *cl, *body, *chunks;
   ngx_http_upstream_t           *u;
+
+  u_char                        *p;
 
   u = r->upstream;
 
@@ -807,12 +814,52 @@ static ngx_int_t ngx_http_hmux_create_request(ngx_http_request_t *r) {
   }
 
   NGX_HMUX_WRITE_STR(b->last, HMUX_SERVER_NAME, r->headers_in.server);
+
   // server port
+  if (ngx_connection_local_sockaddr(r->connection, NULL, 0) != NGX_OK) {
+    return NGX_ERROR;
+  }
+
+  switch (r->connection->local_sockaddr->sa_family) {
+#if (NGX_HAVE_INET6)
+    case AF_INET6:
+      sin6 = (struct sockaddr_in6 *) r->connection->local_sockaddr;
+      port = ntohs(sin6->sin6_port);
+      break;
+#endif
+    default: /* AF_INET */
+      sin = (struct sockaddr_in *) r->connection->local_sockaddr;
+      port = ntohs(sin->sin_port);
+      break;
+  }
+
+  p = b->last;
+  b->last = ngx_sprintf(p + NGX_HMUX_STRING_LEN(0), "%ui", port);
+  port_len = b->last - p - NGX_HMUX_STRING_LEN(0);
+  NGX_HMUX_WRITE_CMD(p, CSE_SERVER_PORT, port_len);
 
   NGX_HMUX_WRITE_STR(b->last, CSE_REMOTE_HOST, r->connection->addr_text);
   NGX_HMUX_WRITE_STR(b->last, CSE_REMOTE_ADDR, r->connection->addr_text);
+
   // remote port
-  
+  switch (r->connection->sockaddr->sa_family) {
+#if (NGX_HAVE_INET6)
+    case AF_INET6:
+      sin6 = (struct sockaddr_in6 *) r->connection->sockaddr;
+      port = ntohs(sin6->sin6_port);
+      break;
+#endif
+    default: /* AF_INET */
+      sin = (struct sockaddr_in *) r->connection->sockaddr;
+      port = ntohs(sin->sin_port);
+      break;
+  }
+
+  p = b->last;
+  b->last = ngx_sprintf(p + NGX_HMUX_STRING_LEN(0), "%ui", port);
+  port_len = b->last - p - NGX_HMUX_STRING_LEN(0);
+  NGX_HMUX_WRITE_CMD(p, CSE_REMOTE_PORT, port_len);
+
   if (r->headers_in.user.len){
     NGX_HMUX_WRITE_STR(b->last, CSE_REMOTE_USER, r->headers_in.user);
     NGX_HMUX_WRITE_CMD(b->last, CSE_AUTH_TYPE, sizeof("Basic") - 1);
@@ -1386,12 +1433,12 @@ ngx_http_hmux_chunked_filter(ngx_event_pipe_t *p, ngx_buf_t *buf){
       switch (ctx->cmd) {
         case HMUX_QUIT:
         case HMUX_EXIT:
-          ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-              "http hmux send quit");
-
           p->length = 0;
           p->upstream_done = 1;
           r->upstream->keepalive = ctx->cmd == HMUX_QUIT;
+
+          ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+              "http hmux send quit. k:%d", r->upstream->keepalive);
 
           break;
 
@@ -1541,11 +1588,11 @@ static ngx_int_t ngx_http_hmux_non_buffered_chunked_filter(void *data,
       switch (ctx->cmd){
         case HMUX_QUIT:
         case HMUX_EXIT:
-          ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-              "http hmux get hmux quit");
-
           u->length = 0;
           u->keepalive = ctx->cmd == HMUX_QUIT;
+
+          ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+              "http hmux get hmux quit, k:%d", u->keepalive);
 
           return NGX_OK;
 
