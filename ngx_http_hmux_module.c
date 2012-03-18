@@ -119,6 +119,12 @@ typedef struct {
   u_char                          cmd;
 } ngx_http_hmux_ctx_t;
 
+typedef struct {
+  u_char                          cmd;
+  ngx_str_t                       value;
+  ngx_uint_t                      if_empty_skip;
+} ngx_http_hmux_param_t;
+
 static ngx_int_t ngx_http_variable_hmux_request_uri(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data);
 static ngx_int_t ngx_http_variable_hmux_server_port(ngx_http_request_t *r,
@@ -390,6 +396,27 @@ static ngx_http_variable_t  ngx_http_hmux_variables[] = {
 static ngx_path_init_t  ngx_http_hmux_temp_path = {
   ngx_string(NGX_HTTP_HMUX_TEMP_PATH), { 1, 2, 0 }
 };
+
+#if 0
+static ngx_http_hmux_param_t ngx_http_hmux_params[] = {
+  { HMUX_CHANNEL,       ngx_string("\x00\x01"),         0 },
+  { HMUX_URL,           ngx_string("$hmux_uri"),        0 },
+  { HMUX_METHOD,        ngx_string("$request_method"),  0 },
+  { CSE_PROTOCOL,       ngx_string("$server_protocol"), 0 },
+  { CSE_QUERY_STRING,   ngx_string("$args"),            1 },
+  { HMUX_SERVER_NAME,   ngx_string("$host"),            0 },
+  { CSE_SERVER_PORT,    ngx_string("$server_port"),     0 },
+  { CSE_REMOTE_HOST,    ngx_string("$remote_addr"),     0 },
+  { CSE_REMOTE_ADDR,    ngx_string("$remote_addr"),     0 },
+  { CSE_REMOTE_PORT,    ngx_string("$remote_port"),     0 },
+  { CSE_REMOTE_USER,    ngx_string("$remote_user"),     2 },
+  { CSE_AUTH_TYPE,      ngx_string("Basic"),            0 },
+  { CSE_CONTENT_LENGTH, ngx_string("$content_length"),  1 },
+  { CSE_CONTENT_TYPE,   ngx_string("$content_type"),    1 },
+
+  { 0, ngx_null_string, 0 }
+};
+#endif
 
 static ngx_int_t ngx_http_hmux_handler(ngx_http_request_t *r){
   ngx_int_t                 rc;
