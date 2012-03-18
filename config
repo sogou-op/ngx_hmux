@@ -1,3 +1,6 @@
 ngx_addon_name=ngx_http_hmux_module
 HTTP_MODULES="$HTTP_MODULES ngx_http_hmux_module"
 NGX_ADDON_SRCS="$NGX_ADDON_SRCS $ngx_addon_dir/ngx_http_hmux_module.c"
+
+NGX_HTTP_HMUX_TEMP_PATH=${NGX_HTTP_HMUX_TEMP_PATH:-hmux_temp}
+have=NGX_HTTP_HMUX_TEMP_PATH value="\"$NGX_HTTP_HMUX_TEMP_PATH\"" . auto/define

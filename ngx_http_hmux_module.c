@@ -88,6 +88,17 @@ typedef struct {
   ngx_http_complex_value_t        *complex_upstream;
 
   size_t                          ack_size;
+
+  ngx_array_t                     *flushes;
+
+  ngx_array_t                     *headers_set_len;
+  ngx_array_t                     *headers_set;
+  ngx_hash_t                      headers_set_hash;
+
+  ngx_array_t                     *headers_source;
+
+  ngx_uint_t                      headers_hash_max_size;
+  ngx_uint_t                      headers_hash_bucket_size;
 } ngx_http_hmux_loc_conf_t;
 
 typedef struct {
@@ -108,14 +119,23 @@ typedef struct {
   u_char                          cmd;
 } ngx_http_hmux_ctx_t;
 
+static ngx_int_t ngx_http_variable_hmux_request_uri(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data);
+static ngx_int_t ngx_http_variable_hmux_server_port(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data);
+
 void ngx_http_upstream_next(ngx_http_request_t *r, ngx_http_upstream_t *u,
     ngx_uint_t ft_type);
 void ngx_http_upstream_finalize_request(ngx_http_request_t *r,
     ngx_http_upstream_t *u, ngx_int_t rc);
 
+static ngx_int_t ngx_http_hmux_add_vars(ngx_conf_t *cf);
+
 static void *ngx_http_hmux_create_loc_conf(ngx_conf_t *cf);
 static char *ngx_http_hmux_merge_loc_conf(ngx_conf_t *cf,
     void *parent, void *child);
+static ngx_int_t ngx_http_hmux_merge_headers(ngx_conf_t *cf,
+    ngx_http_hmux_loc_conf_t *conf, ngx_http_hmux_loc_conf_t *prev);
 
 static char *ngx_http_hmux_pass(ngx_conf_t *cf, ngx_command_t *cmd,
         void *conf);
@@ -170,6 +190,13 @@ static ngx_command_t ngx_http_hmux_commands[] = {
     offsetof(ngx_http_hmux_loc_conf_t, upstream.buffering),
     NULL },
 
+  { ngx_string("hmux_ignore_client_abort"),
+    NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+    ngx_conf_set_flag_slot,
+    NGX_HTTP_LOC_CONF_OFFSET,
+    offsetof(ngx_http_hmux_loc_conf_t, upstream.ignore_client_abort),
+    NULL },
+
   { ngx_string("hmux_bind"),
     NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
     ngx_http_upstream_bind_set_slot,
@@ -198,6 +225,27 @@ static ngx_command_t ngx_http_hmux_commands[] = {
     offsetof(ngx_http_hmux_loc_conf_t, upstream.intercept_errors),
     NULL },
 
+  { ngx_string("hmux_set_header"),
+    NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE2,
+    ngx_conf_set_keyval_slot,
+    NGX_HTTP_LOC_CONF_OFFSET,
+    offsetof(ngx_http_hmux_loc_conf_t, headers_source),
+    NULL },
+
+  { ngx_string("hmux_headers_hash_max_size"),
+    NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+    ngx_conf_set_num_slot,
+    NGX_HTTP_LOC_CONF_OFFSET,
+    offsetof(ngx_http_hmux_loc_conf_t, headers_hash_max_size),
+    NULL },
+
+  { ngx_string("hmux_headers_hash_bucket_size"),
+    NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+    ngx_conf_set_num_slot,
+    NGX_HTTP_LOC_CONF_OFFSET,
+    offsetof(ngx_http_hmux_loc_conf_t, headers_hash_bucket_size),
+    NULL },
+
   { ngx_string("hmux_buffer_size"),
     NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
     ngx_conf_set_size_slot,
@@ -217,6 +265,34 @@ static ngx_command_t ngx_http_hmux_commands[] = {
     ngx_conf_set_bufs_slot,
     NGX_HTTP_LOC_CONF_OFFSET,
     offsetof(ngx_http_hmux_loc_conf_t, upstream.bufs),
+    NULL },
+
+  { ngx_string("hmux_busy_buffers_size"),
+    NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+    ngx_conf_set_size_slot,
+    NGX_HTTP_LOC_CONF_OFFSET,
+    offsetof(ngx_http_hmux_loc_conf_t, upstream.busy_buffers_size_conf),
+    NULL },
+
+  { ngx_string("hmux_temp_path"),
+    NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1234,
+    ngx_conf_set_path_slot,
+    NGX_HTTP_LOC_CONF_OFFSET,
+    offsetof(ngx_http_hmux_loc_conf_t, upstream.temp_path),
+    NULL },
+
+  { ngx_string("hmux_max_temp_file_size"),
+    NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+    ngx_conf_set_size_slot,
+    NGX_HTTP_LOC_CONF_OFFSET,
+    offsetof(ngx_http_hmux_loc_conf_t, upstream.max_temp_file_size_conf),
+    NULL },
+
+  { ngx_string("hmux_temp_file_write_size"),
+    NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+    ngx_conf_set_size_slot,
+    NGX_HTTP_LOC_CONF_OFFSET,
+    offsetof(ngx_http_hmux_loc_conf_t, upstream.temp_file_write_size_conf),
     NULL },
 
   { ngx_string("hmux_next_upstream"),
@@ -251,7 +327,7 @@ static ngx_command_t ngx_http_hmux_commands[] = {
 };
 
 static ngx_http_module_t ngx_http_hmux_module_ctx = {
-  NULL,                                     /* preconfiguration */
+  ngx_http_hmux_add_vars,                   /* preconfiguration */
   NULL,                                     /* postconfiguration */
 
   NULL,                                     /* create main configuration */
@@ -279,6 +355,18 @@ ngx_module_t ngx_http_hmux_module = {
   NGX_MODULE_V1_PADDING
 };
 
+static ngx_keyval_t  ngx_http_hmux_headers[] = {
+  { ngx_string("Content-Type"), ngx_string("") },
+  { ngx_string("Content-Length"), ngx_string("") },
+  { ngx_string("Expect"), ngx_string("") },
+
+  { ngx_string("SCRIPT_URI"), ngx_string("$hmux_request_uri") },
+  { ngx_string("SCRIPT_URL"),
+    ngx_string("$scheme://$host$hmux_server_port$hmux_request_uri") },
+
+  { ngx_null_string, ngx_null_string }
+};
+
 static ngx_str_t  ngx_http_hmux_hide_headers[] = {
   ngx_string("Status"),
   ngx_string("X-Accel-Expires"),
@@ -287,6 +375,20 @@ static ngx_str_t  ngx_http_hmux_hide_headers[] = {
   ngx_string("X-Accel-Buffering"),
   ngx_string("X-Accel-Charset"),
   ngx_null_string
+};
+
+static ngx_http_variable_t  ngx_http_hmux_variables[] = {
+  { ngx_string("hmux_request_uri"), NULL,
+      ngx_http_variable_hmux_request_uri, 0, 0, 0 },
+
+  { ngx_string("hmux_server_port"), NULL,
+      ngx_http_variable_hmux_server_port, 0, 0, 0 },
+
+  { ngx_null_string, NULL, NULL, 0, 0, 0 }
+};
+
+static ngx_path_init_t  ngx_http_hmux_temp_path = {
+  ngx_string(NGX_HTTP_HMUX_TEMP_PATH), { 1, 2, 0 }
 };
 
 static ngx_int_t ngx_http_hmux_handler(ngx_http_request_t *r){
@@ -689,7 +791,8 @@ ngx_http_hmux_get_data_chain(ngx_http_request_t *r, ngx_chain_t *in,
 }
 
 static ngx_int_t ngx_http_hmux_create_request(ngx_http_request_t *r) {
-  size_t                        len, uri_len, port_len;
+  ngx_http_hmux_loc_conf_t      *hlcf;
+  size_t                        len, uri_len, port_len, value_len;
   uintptr_t                     escape;
   ngx_uint_t                    i, unparsed_uri, port;
 
@@ -707,7 +810,13 @@ static ngx_int_t ngx_http_hmux_create_request(ngx_http_request_t *r) {
 
   u_char                        *p;
 
+  ngx_http_script_engine_t      e, le;
+  ngx_http_script_len_code_pt   lcode;
+  ngx_http_script_code_pt       code;
+
   u = r->upstream;
+
+  hlcf = ngx_http_get_module_loc_conf(r, ngx_http_hmux_module);
 
   len = NGX_HMUX_CHANNEL_LEN + 1; // 1 for HMUX_QUIT
 
@@ -752,7 +861,29 @@ static ngx_int_t ngx_http_hmux_create_request(ngx_http_request_t *r) {
       NGX_HMUX_STRING_LEN(sizeof("Basic") - 1);
   }
 
+  if (r->headers_in.content_length != NULL) {
+    len += NGX_HMUX_STRING_LEN(r->headers_in.content_length->value.len);
+  }
+
+  if (r->headers_in.content_type != NULL) {
+    len += NGX_HMUX_STRING_LEN(r->headers_in.content_type->value.len);
+  }
+
   // headers
+  ngx_http_script_flush_no_cacheable_variables(r, hlcf->flushes);
+
+  le.ip = hlcf->headers_set_len->elts;
+  le.request = r;
+  le.flushed = 1;
+
+  while (*(uintptr_t *) le.ip) {
+    while (*(uintptr_t *) le.ip) {
+      lcode = *(ngx_http_script_len_code_pt *) le.ip;
+      len += lcode(&le);
+    }
+    le.ip += sizeof(uintptr_t);
+  }
+
   part = &r->headers_in.headers.part;
   header = part->elts;
 
@@ -768,7 +899,13 @@ static ngx_int_t ngx_http_hmux_create_request(ngx_http_request_t *r) {
       i = 0;
     }
 
-    len += NGX_HMUX_STRING_LEN(header[i].key.len) + 
+    if (ngx_hash_find(&hlcf->headers_set_hash, header[i].hash,
+          header[i].lowcase_key, header[i].key.len))
+    {
+      continue;
+    }
+
+    len += NGX_HMUX_STRING_LEN(header[i].key.len)
       + NGX_HMUX_STRING_LEN(header[i].value.len);
   }
 
@@ -866,7 +1003,55 @@ static ngx_int_t ngx_http_hmux_create_request(ngx_http_request_t *r) {
     b->last = ngx_cpymem(b->last, "Basic", sizeof("Basic") - 1);
   }
 
+  if (r->headers_in.content_length != NULL) {
+    NGX_HMUX_WRITE_STR(b->last, CSE_CONTENT_LENGTH,
+        r->headers_in.content_length->value);
+  }
+
+  if (r->headers_in.content_type != NULL) {
+    NGX_HMUX_WRITE_STR(b->last, CSE_CONTENT_TYPE,
+        r->headers_in.content_type->value);
+  }
+
   // headers
+  ngx_memzero(&e, sizeof(ngx_http_script_engine_t));
+  e.ip = hlcf->headers_set->elts;
+  e.pos = b->last;
+  e.request = r;
+  e.flushed = 1;
+
+  le.ip = hlcf->headers_set_len->elts;
+
+  while (*(uintptr_t *) le.ip) {
+    lcode = *(ngx_http_script_len_code_pt *) le.ip;
+
+    /* skip the header line name length */
+    (void) lcode(&le);
+
+    if (*(ngx_http_script_len_code_pt *) le.ip) {
+      for (value_len = 0; *(uintptr_t *) le.ip; value_len += lcode(&le)) {
+        lcode = *(ngx_http_script_len_code_pt *) le.ip;
+      }
+
+      e.skip = value_len == 0;
+
+      e.status = value_len;
+    } else {
+      e.skip = 0;
+    }
+
+    le.ip += sizeof(uintptr_t);
+
+    while (*(uintptr_t *)e.ip) {
+      code = *(ngx_http_script_code_pt *) e.ip;
+      code((ngx_http_script_engine_t *) &e);
+    }
+
+    e.ip += sizeof(uintptr_t);
+  }
+
+  b->last = e.pos;
+
   part = &r->headers_in.headers.part;
   header = part->elts;
 
@@ -882,17 +1067,9 @@ static ngx_int_t ngx_http_hmux_create_request(ngx_http_request_t *r) {
       i = 0;
     }
 
-    if (NGX_HMUX_IS_HEADER(header[i], "content-type")) {
-      NGX_HMUX_WRITE_STR(b->last, CSE_CONTENT_TYPE, header[i].value);
-      continue;
-    }
-
-    if (NGX_HMUX_IS_HEADER(header[i], "content-length")) {
-      NGX_HMUX_WRITE_STR(b->last, CSE_CONTENT_LENGTH, header[i].value);
-      continue;
-    }
-
-    if (NGX_HMUX_IS_HEADER(header[i], "expect")) {
+    if (ngx_hash_find(&hlcf->headers_set_hash, header[i].hash,
+          header[i].lowcase_key, header[i].key.len))
+    {
       continue;
     }
 
@@ -903,6 +1080,10 @@ static ngx_int_t ngx_http_hmux_create_request(ngx_http_request_t *r) {
         "http hmux header: \"%V: %V\"",
         &header[i].key, &header[i].value);
   }
+
+  ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+      "http hmux headers write done. alloc:%uz used:%uz",
+      len, b->last - b->start);
 
   body = u->request_bufs;
   u->request_bufs = cl;
@@ -1645,6 +1826,91 @@ ngx_http_hmux_finalize_request(ngx_http_request_t *r, ngx_int_t rc)
   return;
 }
 
+static ngx_int_t ngx_http_variable_hmux_request_uri(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data) {
+  u_char                      *p;
+
+  v->valid = 1;
+  v->no_cacheable = 0;
+  v->not_found = 0;
+
+  p = ngx_strlchr(r->unparsed_uri.data,
+      r->unparsed_uri.data + r->unparsed_uri.len, '?');
+
+  v->data = r->unparsed_uri.data;
+  v->len = (p == NULL) ? r->unparsed_uri.len : (p - r->unparsed_uri.data);
+
+  return NGX_OK;
+}
+
+static ngx_int_t ngx_http_variable_hmux_server_port(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data) {
+  ngx_uint_t            port;
+  struct sockaddr_in   *sin;
+#if (NGX_HAVE_INET6)
+  struct sockaddr_in6  *sin6;
+#endif
+
+  v->len = 0;
+  v->valid = 1;
+  v->no_cacheable = 0;
+  v->not_found = 0;
+
+  if (ngx_connection_local_sockaddr(r->connection, NULL, 0) != NGX_OK) {
+    return NGX_ERROR;
+  }
+
+  switch (r->connection->local_sockaddr->sa_family) {
+#if (NGX_HAVE_INET6)
+    case AF_INET6:
+      sin6 = (struct sockaddr_in6 *) r->connection->local_sockaddr;
+      port = ntohs(sin6->sin6_port);
+      break;
+#endif
+    default: /* AF_INET */
+      sin = (struct sockaddr_in *) r->connection->local_sockaddr;
+      port = ntohs(sin->sin_port);
+      break;
+  }
+
+  if (port > 0 && port < 65536) {
+#if (NGX_HTTP_SSL)
+    if (r->connection->ssl) {
+      if (port == 443) {
+        return NGX_OK;
+      }
+    } else 
+#endif
+    if (port == 80) {
+      return NGX_OK;
+    }
+
+    v->data = ngx_pnalloc(r->pool, sizeof(":65535") - 1);
+    if (v->data == NULL) {
+      return NGX_ERROR;
+    }
+    v->len = ngx_sprintf(v->data, ":%ui", port) - v->data;
+  }
+
+  return NGX_OK;
+}
+
+static ngx_int_t ngx_http_hmux_add_vars(ngx_conf_t *cf) {
+  ngx_http_variable_t   *var, *v;
+
+  for (v = ngx_http_hmux_variables; v->name.len; v++) {
+    var = ngx_http_add_variable(cf, &v->name, v->flags);
+    if (var == NULL) {
+      return NGX_ERROR;
+    }
+
+    var->get_handler = v->get_handler;
+    var->data = v->data;
+  }
+
+  return NGX_OK;
+}
+
 static void *ngx_http_hmux_create_loc_conf(ngx_conf_t *cf){
   ngx_http_hmux_loc_conf_t    *conf;
 
@@ -1653,7 +1919,18 @@ static void *ngx_http_hmux_create_loc_conf(ngx_conf_t *cf){
     return NULL;
   }
 
+  /*
+   * set by calloc
+   *    conf->upstream.temp_path = NULL;
+   *
+   *    conf->headers_source = NULL;
+   *    conf->headers_set_len = NULL;
+   *    conf->headers_set = NULL;
+   *    conf->headers_set_hash = NULL;
+   */
+
   conf->upstream.buffering = NGX_CONF_UNSET;
+  conf->upstream.ignore_client_abort = NGX_CONF_UNSET;
 
   conf->upstream.connect_timeout = NGX_CONF_UNSET_MSEC;
   conf->upstream.send_timeout = NGX_CONF_UNSET_MSEC;
@@ -1670,17 +1947,20 @@ static void *ngx_http_hmux_create_loc_conf(ngx_conf_t *cf){
   conf->upstream.hide_headers = NGX_CONF_UNSET_PTR;
   conf->upstream.pass_headers = NGX_CONF_UNSET_PTR;
 
+  conf->upstream.intercept_errors = NGX_CONF_UNSET;
+
   /* the hardcoded values */
   conf->upstream.cyclic_temp_file = 0;
-  conf->upstream.ignore_client_abort = 0;
   conf->upstream.send_lowat = 0;
   conf->upstream.bufs.num = 0;
   conf->upstream.busy_buffers_size = 0;
   conf->upstream.max_temp_file_size = 0;
   conf->upstream.temp_file_write_size = 0;
-  conf->upstream.intercept_errors = 1;
   conf->upstream.intercept_404 = 1;
   conf->upstream.pass_request_headers = 0;
+
+  conf->headers_hash_max_size = NGX_CONF_UNSET_UINT;
+  conf->headers_hash_bucket_size = NGX_CONF_UNSET_UINT;
 
   ngx_str_set(&conf->upstream.module, "hmux");
 
@@ -1699,6 +1979,9 @@ static char *ngx_http_hmux_merge_loc_conf(ngx_conf_t *cf,
 
   ngx_conf_merge_value(conf->upstream.buffering,
       prev->upstream.buffering, 1);
+
+  ngx_conf_merge_value(conf->upstream.ignore_client_abort,
+      prev->upstream.ignore_client_abort, 0);
 
   ngx_conf_merge_msec_value(conf->upstream.connect_timeout,
       prev->upstream.connect_timeout, 60000);
@@ -1816,8 +2099,28 @@ static char *ngx_http_hmux_merge_loc_conf(ngx_conf_t *cf,
       NGX_HTTP_UPSTREAM_FT_OFF;
   }
 
-  hash.max_size = 512;
-  hash.bucket_size = ngx_align(64, ngx_cacheline_size);
+  if (ngx_conf_merge_path_value(cf, &conf->upstream.temp_path,
+        prev->upstream.temp_path,
+        &ngx_http_hmux_temp_path)
+      != NGX_OK)
+  {
+    return NGX_CONF_ERROR;
+  }
+
+  ngx_conf_merge_value(conf->upstream.intercept_errors,
+      prev->upstream.intercept_errors, 0);
+
+  ngx_conf_merge_uint_value(conf->headers_hash_max_size,
+      prev->headers_hash_max_size, 512);
+
+  ngx_conf_merge_uint_value(conf->headers_hash_bucket_size,
+      prev->headers_hash_bucket_size, 64);
+
+  conf->headers_hash_bucket_size = ngx_align(conf->headers_hash_bucket_size,
+      ngx_cacheline_size);
+
+  hash.max_size = conf->headers_hash_max_size;
+  hash.bucket_size = conf->headers_hash_bucket_size;
   hash.name = "hmux_hide_headers_hash";
 
   if (ngx_http_upstream_hide_headers_hash(cf, &conf->upstream,
@@ -1842,7 +2145,247 @@ static char *ngx_http_hmux_merge_loc_conf(ngx_conf_t *cf,
     }
   }
 
+  if (ngx_http_hmux_merge_headers(cf, conf, prev) != NGX_OK) {
+    return NGX_CONF_ERROR;
+  }
+
   return NGX_CONF_OK;
+}
+
+void ngx_hmux_value_cmd_code(ngx_http_script_engine_t *e) {
+  ngx_http_script_code_pt       *code;
+
+  code = (ngx_http_script_code_pt *) e->ip;
+
+  if (!e->skip) {
+    NGX_HMUX_WRITE_CMD(e->pos, HMUX_STRING, e->status);
+  }
+
+  e->ip += sizeof(ngx_http_script_code_pt);
+
+  ngx_log_debug1(NGX_LOG_DEBUG_HTTP, e->request->connection->log, 0,
+      "http hmux set value len: %ui", e->status);
+}
+
+static ngx_int_t
+ngx_http_hmux_merge_headers(ngx_conf_t *cf, ngx_http_hmux_loc_conf_t *conf,
+        ngx_http_hmux_loc_conf_t *prev)
+{
+  u_char                        *p;
+  size_t                        size;
+  uintptr_t                     *code;
+  ngx_uint_t                    i;
+  ngx_array_t                   headers_names, headers_merged;
+  ngx_keyval_t                  *src, *s, *h;
+  ngx_hash_key_t                *hk;
+  ngx_hash_init_t               hash;
+  ngx_http_script_compile_t     sc;
+  ngx_http_script_copy_code_t   *copy;
+
+  if (conf->headers_source == NULL) {
+    conf->flushes = prev->flushes;
+    conf->headers_set_len = prev->headers_set_len;
+    conf->headers_set = prev->headers_set;
+    conf->headers_set_hash = prev->headers_set_hash;
+    conf->headers_source = prev->headers_source;
+  }
+
+  if (conf->headers_set_hash.buckets) {
+    return NGX_OK;
+  }
+
+  if (ngx_array_init(&headers_names, cf->temp_pool, 4, sizeof(ngx_hash_key_t))
+      != NGX_OK)
+  {
+    return NGX_ERROR;
+  }
+
+  if (ngx_array_init(&headers_merged, cf->temp_pool, 4, sizeof(ngx_keyval_t))
+      != NGX_OK)
+  {
+    return NGX_ERROR;
+  }
+
+  if (conf->headers_source == NULL) {
+    conf->headers_source = ngx_array_create(cf->pool, 4,
+        sizeof(ngx_keyval_t));
+    if (conf->headers_source == NULL) {
+      return NGX_ERROR;
+    }
+  }
+
+  conf->headers_set_len = ngx_array_create(cf->pool, 64, 1);
+  if (conf->headers_set_len == NULL) {
+    return NGX_ERROR;
+  }
+
+  conf->headers_set = ngx_array_create(cf->pool, 512, 1);
+  if (conf->headers_set == NULL) {
+    return NGX_ERROR;
+  }
+
+  h = ngx_http_hmux_headers;
+
+  src = conf->headers_source->elts;
+  for (i = 0; i < conf->headers_source->nelts; i++) {
+
+    s = ngx_array_push(&headers_merged);
+    if (s == NULL) {
+      return NGX_ERROR;
+    }
+
+    *s = src[i];
+  }
+
+  while (h->key.len) {
+
+    src = headers_merged.elts;
+    for (i = 0; i < headers_merged.nelts; i++) {
+      if (ngx_strcasecmp(h->key.data, src[i].key.data) == 0) {
+        goto next;
+      }
+    }
+
+    s = ngx_array_push(&headers_merged);
+    if (s == NULL) {
+      return NGX_ERROR;
+    }
+
+    *s = *h;
+
+next:
+
+    h++;
+  }
+
+  src = headers_merged.elts;
+  for (i = 0; i < headers_merged.nelts; i++) {
+
+    hk = ngx_array_push(&headers_names);
+    if (hk == NULL) {
+      return NGX_ERROR;
+    }
+
+    hk->key = src[i].key;
+    hk->key_hash = ngx_hash_key_lc(src[i].key.data, src[i].key.len);
+    hk->value = (void *) 1;
+
+    if (src[i].value.len == 0) {
+      continue;
+    }
+
+    if (ngx_http_script_variables_count(&src[i].value) == 0) {
+      copy = ngx_array_push_n(conf->headers_set_len,
+          sizeof(ngx_http_script_copy_code_t));
+      if (copy == NULL) {
+        return NGX_ERROR;
+      }
+
+      copy->code = (ngx_http_script_code_pt)
+        ngx_http_script_copy_len_code;
+      copy->len = NGX_HMUX_STRING_LEN(src[i].key.len)
+        + NGX_HMUX_STRING_LEN(src[i].value.len);
+
+      size = (sizeof(ngx_http_script_copy_code_t)
+          + NGX_HMUX_STRING_LEN(src[i].key.len)
+          + NGX_HMUX_STRING_LEN(src[i].value.len)
+          + sizeof(uintptr_t) - 1)
+        & ~(sizeof(uintptr_t) - 1);
+
+      copy = ngx_array_push_n(conf->headers_set, size);
+      if (copy == NULL) {
+        return NGX_ERROR;
+      }
+
+      copy->code = ngx_http_script_copy_code;
+      copy->len = NGX_HMUX_STRING_LEN(src[i].key.len)
+        + NGX_HMUX_STRING_LEN(src[i].value.len);
+
+      p = (u_char *) copy + sizeof(ngx_http_script_copy_code_t);
+
+      NGX_HMUX_WRITE_STR(p, HMUX_HEADER, src[i].key);
+      NGX_HMUX_WRITE_STR(p, HMUX_STRING, src[i].value);
+
+    } else {
+      copy = ngx_array_push_n(conf->headers_set_len,
+          sizeof(ngx_http_script_copy_code_t));
+      if (copy == NULL) {
+        return NGX_ERROR;
+      }
+
+      copy->code = (ngx_http_script_code_pt)
+        ngx_http_script_copy_len_code;
+      copy->len = NGX_HMUX_STRING_LEN(src[i].key.len)
+        + NGX_HMUX_STRING_LEN(0);   // value cmd and len
+
+      size = (sizeof(ngx_http_script_copy_code_t)
+          + NGX_HMUX_STRING_LEN(src[i].key.len) + sizeof(uintptr_t) - 1)
+        & ~(sizeof(uintptr_t) - 1);
+
+      copy = ngx_array_push_n(conf->headers_set, size);
+      if (copy == NULL) {
+        return NGX_ERROR;
+      }
+
+      copy->code = ngx_http_script_copy_code;
+      copy->len = NGX_HMUX_STRING_LEN(src[i].key.len);
+
+      p = (u_char *) copy + sizeof(ngx_http_script_copy_code_t);
+      NGX_HMUX_WRITE_STR(p, HMUX_HEADER, src[i].key);
+
+      copy = ngx_array_push_n(conf->headers_set,
+          sizeof(ngx_http_script_code_pt));
+      if (copy == NULL) {
+        return NGX_ERROR;
+      }
+
+      copy->code = ngx_hmux_value_cmd_code;
+
+      ngx_memzero(&sc, sizeof(ngx_http_script_compile_t));
+
+      sc.cf = cf;
+      sc.source = &src[i].value;
+      sc.flushes = &conf->flushes;
+      sc.lengths = &conf->headers_set_len;
+      sc.values = &conf->headers_set;
+
+      if (ngx_http_script_compile(&sc) != NGX_OK) {
+        return NGX_ERROR;
+      }
+    }
+
+    code = ngx_array_push_n(conf->headers_set_len, sizeof(uintptr_t));
+    if (code == NULL) {
+      return NGX_ERROR;
+    }
+
+    *code = (uintptr_t) NULL;
+
+    code = ngx_array_push_n(conf->headers_set, sizeof(uintptr_t));
+    if (code == NULL) {
+      return NGX_ERROR;
+    }
+
+    *code = (uintptr_t) NULL;
+  }
+
+  code = ngx_array_push_n(conf->headers_set_len, sizeof(uintptr_t));
+  if (code == NULL) {
+    return NGX_ERROR;
+  }
+
+  *code = (uintptr_t) NULL;
+
+
+  hash.hash = &conf->headers_set_hash;
+  hash.key = ngx_hash_key_lc;
+  hash.max_size = conf->headers_hash_max_size;
+  hash.bucket_size = conf->headers_hash_bucket_size;
+  hash.name = "hmux_headers_hash";
+  hash.pool = cf->pool;
+  hash.temp_pool = NULL;
+
+  return ngx_hash_init(&hash, headers_names.elts, headers_names.nelts);
 }
 
 static char *ngx_http_hmux_pass(ngx_conf_t *cf, ngx_command_t *cmd,
