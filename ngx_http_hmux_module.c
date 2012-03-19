@@ -18,10 +18,6 @@
   NGX_HMUX_WRITE_CMD(p, cmd, (str).len);                          \
   p = ngx_copy(p, (str).data, (str).len)
 
-#define NGX_HMUX_IS_HEADER(header, test)                          \
-    (header.key.len == sizeof(test) - 1 &&                        \
-    ngx_strncmp(header.lowcase_key, test, sizeof(test) - 1) == 0)
-
 #define HMUX_CHANNEL        'C' 
 #define HMUX_ACK            'A'
 #define HMUX_ERROR          'E'
@@ -831,6 +827,8 @@ static ngx_int_t ngx_http_hmux_create_request(ngx_http_request_t *r) {
   ngx_list_part_t               *part;
   ngx_table_elt_t               *header;
 
+  ngx_str_t                     method;
+
   ngx_buf_t                     *b;
   ngx_chain_t                   *cl, *body, *chunks;
   ngx_http_upstream_t           *u;
@@ -869,8 +867,15 @@ static ngx_int_t ngx_http_hmux_create_request(ngx_http_request_t *r) {
     return NGX_ERROR;
   }
   
+  if (u->method.len) {
+    /* HEAD was changed to GET to cache response */
+    method = u->method;
+  } else {
+    method = r->method_name;
+  }
+
   len += NGX_HMUX_STRING_LEN(uri_len) +
-    NGX_HMUX_STRING_LEN(r->method_name.len) +
+    NGX_HMUX_STRING_LEN(method.len) +
     NGX_HMUX_STRING_LEN(r->http_protocol.len);
 
   if (r->args.len) {
@@ -970,7 +975,7 @@ static ngx_int_t ngx_http_hmux_create_request(ngx_http_request_t *r) {
 
   u->uri.len = b->last - u->uri.data;
 
-  NGX_HMUX_WRITE_STR(b->last, HMUX_METHOD, r->method_name);
+  NGX_HMUX_WRITE_STR(b->last, HMUX_METHOD, method);
   NGX_HMUX_WRITE_STR(b->last, CSE_PROTOCOL, r->http_protocol);
 
   if (r->args.len) {
