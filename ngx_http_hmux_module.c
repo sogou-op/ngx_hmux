@@ -1477,6 +1477,9 @@ static ngx_int_t ngx_http_hmux_process_header(ngx_http_request_t *r) {
           break;
 
         case CSE_SEND_HEADER:
+          ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+              "http hmux header done");
+
           return NGX_OK;
 
         case HMUX_ACK:
@@ -1988,7 +1991,7 @@ static void *ngx_http_hmux_create_loc_conf(ngx_conf_t *cf){
   conf->upstream.busy_buffers_size = 0;
   conf->upstream.max_temp_file_size = 0;
   conf->upstream.temp_file_write_size = 0;
-  conf->upstream.intercept_404 = 1;
+  conf->upstream.intercept_404 = 0; // if set 1, connection will be closed
   conf->upstream.pass_request_headers = 0;
 
   conf->headers_hash_max_size = NGX_CONF_UNSET_UINT;
