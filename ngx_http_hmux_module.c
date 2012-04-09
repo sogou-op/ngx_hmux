@@ -2,6 +2,10 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 
+#define NGX_HMUX_FLUSH_OFF          0
+#define NGX_HMUX_FLUSH_ON           1
+#define NGX_HMUX_FLUSH_ALWAYS       2
+
 #define NGX_HMUX_DEFAULT_PORT       6802
 #define NGX_HMUX_CHANNEL_LEN        3
 #define NGX_HMUX_ACK_CMD_LEN        3
@@ -84,6 +88,8 @@ typedef struct {
   ngx_http_complex_value_t        *complex_upstream;
 
   size_t                          ack_size;
+
+  ngx_uint_t                      flush;
 
   ngx_array_t                     *flushes;
 
@@ -173,6 +179,13 @@ static ngx_conf_bitmask_t  ngx_http_hmux_next_upstream_masks[] = {
   { ngx_string("http_404"), NGX_HTTP_UPSTREAM_FT_HTTP_404 },
   { ngx_string("updating"), NGX_HTTP_UPSTREAM_FT_UPDATING },
   { ngx_string("off"), NGX_HTTP_UPSTREAM_FT_OFF },
+  { ngx_null_string, 0 }
+};
+
+static ngx_conf_enum_t  ngx_http_hmux_flush[] = {
+  { ngx_string("off"),    NGX_HMUX_FLUSH_OFF},
+  { ngx_string("on"),     NGX_HMUX_FLUSH_ON},
+  { ngx_string("always"), NGX_HMUX_FLUSH_ALWAYS},
   { ngx_null_string, 0 }
 };
 
@@ -324,6 +337,13 @@ static ngx_command_t ngx_http_hmux_commands[] = {
     NGX_HTTP_LOC_CONF_OFFSET,
     offsetof(ngx_http_hmux_loc_conf_t, ack_size),
     NULL },
+
+  { ngx_string("hmux_flush"),
+    NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+    ngx_conf_set_enum_slot,
+    NGX_HTTP_LOC_CONF_OFFSET,
+    offsetof(ngx_http_hmux_loc_conf_t, flush),
+    &ngx_http_hmux_flush},
 
   ngx_null_command
 };
@@ -1421,14 +1441,12 @@ static ngx_int_t ngx_http_hmux_process_header(ngx_http_request_t *r) {
 
           u->headers_in.status_n = code;
 
-          u->headers_in.status_line.len = ctx->key.len;
-
-          u->headers_in.status_line.data = ngx_pnalloc(r->pool, ctx->key.len);
+          u->headers_in.status_line.data = ngx_pstrdup(r->pool, &ctx->key);
           if (u->headers_in.status_line.data == NULL) {
             return NGX_ERROR;
           }
 
-          ngx_memcpy(u->headers_in.status_line.data, ctx->key.data, ctx->key.len);
+          u->headers_in.status_line.len = ctx->key.len;
 
           ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
               "http hmux status %ui \"%V\"",
@@ -1560,11 +1578,12 @@ static ngx_int_t ngx_http_hmux_input_filter_init(void *data) {
 
 static ngx_int_t
 ngx_http_hmux_chunked_filter(ngx_event_pipe_t *p, ngx_buf_t *buf){
-  ngx_http_request_t      *r;
-  ngx_int_t               rc;
-  ngx_buf_t               *b, **prev;
-  ngx_chain_t             *cl;
-  ngx_http_hmux_ctx_t     *ctx;
+  ngx_http_request_t          *r;
+  ngx_int_t                   rc;
+  ngx_buf_t                   *b, **prev;
+  ngx_chain_t                 *cl;
+  ngx_http_hmux_ctx_t         *ctx;
+  ngx_http_hmux_loc_conf_t    *hlcf;
 
   if (buf->pos == buf->last) {
     return NGX_OK;
@@ -1573,6 +1592,8 @@ ngx_http_hmux_chunked_filter(ngx_event_pipe_t *p, ngx_buf_t *buf){
   r = p->input_ctx;
 
   ctx = ngx_http_get_module_ctx(r, ngx_http_hmux_module);
+
+  hlcf = ngx_http_get_module_loc_conf(r, ngx_http_hmux_module);
 
   b = NULL;
   prev = &buf->shadow;
@@ -1628,19 +1649,17 @@ ngx_http_hmux_chunked_filter(ngx_event_pipe_t *p, ngx_buf_t *buf){
       ngx_log_debug2(NGX_LOG_DEBUG_EVENT, p->log, 0,
           "http hmux input buf #%d %p", b->num, b->pos);
 
-      if (buf->last - buf->pos >= ctx->body_chunk_size) {
+      if (buf->last - buf->pos > ctx->body_chunk_size) {
         buf->pos += ctx->body_chunk_size;
         b->last = buf->pos;
         ctx->body_chunk_size = 0;
+      } else {
+        ctx->body_chunk_size -= buf->last - buf->pos;
+        buf->pos = buf->last;
+        b->last = buf->last;
 
-        continue;
+        break;
       }
-
-      ctx->body_chunk_size -= buf->last - buf->pos;
-      buf->pos = buf->last;
-      b->last = buf->last;
-
-      continue;
     }
 
     rc = ngx_http_hmux_process_cmd(r, ctx, buf, 1);
@@ -1661,6 +1680,14 @@ ngx_http_hmux_chunked_filter(ngx_event_pipe_t *p, ngx_buf_t *buf){
         case HMUX_FLUSH:
           ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
               "http hmux flush received");
+
+          if (hlcf->flush == NGX_HMUX_FLUSH_ON) {
+            if (b) {
+              b->flush = 1;
+            } else if (ngx_http_send_special(r, NGX_HTTP_FLUSH) == NGX_ERROR) {
+              return NGX_ERROR;
+            }
+          }
 
           break;
 
@@ -1687,7 +1714,7 @@ ngx_http_hmux_chunked_filter(ngx_event_pipe_t *p, ngx_buf_t *buf){
     }
   } while (buf->pos != buf->last);
 
-  if (ctx->body_chunk_size) {
+  if (hlcf->flush != NGX_HMUX_FLUSH_ALWAYS && ctx->body_chunk_size) {
     p->length = ctx->body_chunk_size + 1; /* + HMUX_QUIT */
   } else if (!p->upstream_done) {
     p->length = 1;
@@ -1699,6 +1726,10 @@ ngx_http_hmux_chunked_filter(ngx_event_pipe_t *p, ngx_buf_t *buf){
   if (b) {
     b->shadow = buf;
     b->last_shadow = 1;
+
+    if (hlcf->flush == NGX_HMUX_FLUSH_ALWAYS) {
+      b->flush = 1;
+    }
 
     ngx_log_debug2(NGX_LOG_DEBUG_EVENT, p->log, 0,
         "http hmux input buf %p %z", b->pos, b->last - b->pos);
@@ -1734,7 +1765,7 @@ static ngx_buf_t *ngx_http_hmux_append_out_chain(ngx_http_request_t *r,
 
   *ll = cl;
 
-  cl->buf->flush = 1;
+//  cl->buf->flush = 1;
   cl->buf->memory = 1;
 
   if (lll != NULL) {
@@ -1767,6 +1798,8 @@ static ngx_int_t ngx_http_hmux_non_buffered_chunked_filter(void *data,
 
   ll = NULL;
 
+  nb = NULL;
+
   for ( ;; ){
     if (ctx->body_chunk_size) {
       ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
@@ -1790,7 +1823,7 @@ static ngx_int_t ngx_http_hmux_non_buffered_chunked_filter(void *data,
       ctx->body_chunk_size -= len;
 
       if (!bytes) {
-        return NGX_OK;
+        break;
       }
     }
 
@@ -1810,9 +1843,12 @@ static ngx_int_t ngx_http_hmux_non_buffered_chunked_filter(void *data,
           ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
               "http hmux get hmux quit, k:%d", u->keepalive);
 
-          return NGX_OK;
+          goto quit;
 
         case HMUX_FLUSH:
+          ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+              "http hmux flush received, ignore in non-buffered mode");
+
           break;
 
         case HMUX_DATA:
@@ -1837,6 +1873,12 @@ static ngx_int_t ngx_http_hmux_non_buffered_chunked_filter(void *data,
 
       break;
     }
+  }
+
+quit:
+
+  if (nb) {
+    nb->flush = 1;
   }
 
   return NGX_OK;
@@ -1978,6 +2020,7 @@ static void *ngx_http_hmux_create_loc_conf(ngx_conf_t *cf){
   conf->upstream.temp_file_write_size_conf = NGX_CONF_UNSET_SIZE;
 
   conf->ack_size = NGX_CONF_UNSET_SIZE;
+  conf->flush = NGX_CONF_UNSET_UINT;
 
   conf->upstream.hide_headers = NGX_CONF_UNSET_PTR;
   conf->upstream.pass_headers = NGX_CONF_UNSET_PTR;
@@ -2122,6 +2165,8 @@ static char *ngx_http_hmux_merge_loc_conf(ngx_conf_t *cf,
   ngx_conf_merge_size_value(conf->ack_size,
       prev->ack_size,
       16 * 1024);
+
+  ngx_conf_merge_uint_value(conf->flush, prev->flush, NGX_HMUX_FLUSH_ON);
 
   ngx_conf_merge_bitmask_value(conf->upstream.next_upstream,
       prev->upstream.next_upstream,
