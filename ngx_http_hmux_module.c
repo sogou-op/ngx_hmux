@@ -869,17 +869,24 @@ static ngx_int_t ngx_http_hmux_create_request(ngx_http_request_t *r) {
   escape = 0;
   unparsed_uri = 0;
 
-  if (r->valid_unparsed_uri && r == r->main)
-  {
+  if (r->valid_unparsed_uri && r == r->main) {
     unparsed_uri = 1;
+
+    p = ngx_strlchr(r->unparsed_uri.data,
+                    r->unparsed_uri.data + r->unparsed_uri.len, '?');
+    if (p == NULL) {
+      uri_len = r->unparsed_uri.len;
+    } else {
+      uri_len = p - r->unparsed_uri.data;
+    }
   } else {
     if (r->quoted_uri || r->space_in_uri || r->internal) {
       escape = 2 * ngx_escape_uri(NULL, r->uri.data, r->uri.len,
           NGX_ESCAPE_URI);
     }
-  }
 
-  uri_len = r->uri.len + escape;
+    uri_len = r->uri.len + escape;
+  }
 
   if (uri_len == 0) {
     ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
@@ -983,7 +990,7 @@ static ngx_int_t ngx_http_hmux_create_request(ngx_http_request_t *r) {
   u->uri.data = b->last;
 
   if (unparsed_uri){
-    b->last = ngx_copy(b->last, r->uri.data, r->uri.len);
+    b->last = ngx_copy(b->last, r->unparsed_uri.data, uri_len);
   } else {
     if (escape) {
       ngx_escape_uri(b->last, r->uri.data, r->uri.len, NGX_ESCAPE_URI);
