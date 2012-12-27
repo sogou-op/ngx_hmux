@@ -178,23 +178,32 @@ hmux_next_upstream
 Specifies in which cases a request should be passed to the next server:
 
 *error*
-  an error occurred while establishing a connection with the server, passing it a request, or reading the response header;
+    an error occurred while establishing a connection with the server, passing it a request, or reading the response header;
+    
 *timeout*
-  a timeout has occurred while establishing a connection with the server, passing it a request, or reading the response header;
+    a timeout has occurred while establishing a connection with the server, passing it a request, or reading the response header;
+    
 *invalid_header*
-  a server returned empty or invalid response;
+    a server returned empty or invalid response;
+    
 *http_500*
-  a server returned a response with the code 500;
+    a server returned a response with the code 500;
+    
 *http_502*
-  a server returned a response with the code 502;
+    a server returned a response with the code 502;
+    
 *http_503*
-  a server returned a response with the code 503;
+    a server returned a response with the code 503;
+    
 *http_504*
-  a server returned a response with the code 504;
+    a server returned a response with the code 504;
+    
 *http_404*
-  a server returned a response with the code 404;
+    a server returned a response with the code 404;
+    
 *off*
-  disables passing a request to the next server.
+    disables passing a request to the next server.
+    
 It should be understood that passing a request to the next server is only possible if a client was not sent anything yet. That is, if an error or a timeout occurs in the middle of transferring a response, fixing this is impossible.
 
 hmux_pass
